@@ -169,7 +169,8 @@ def softmax(x, axis=-1):
 def sampling_softmax(mean_logit, std_logit, num_samples=10):
 
     # my only real change.
-    logit_shape = (mean_logit.shape[0], num_samples)#, mean_logit.shape[-1])
+    #logit_shape = (mean_logit.shape[0], num_samples)
+    logit_shape = (mean_logit.shape[0], num_samples, mean_logit.shape[-1])
 
     logit_mean = np.expand_dims(mean_logit, axis=1)
     logit_mean = np.repeat(logit_mean, num_samples, axis=1)
