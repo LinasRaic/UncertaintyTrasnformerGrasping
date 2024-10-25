@@ -8,7 +8,7 @@ from tensorflow import keras
 from keras.layers import Input, Dense, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D 
 from keras.models import Model
 import keras_uncertainty as ku
-from keras_uncertainty.layers import stochastic_layers
+from keras_uncertainty.layers import stochastic_layers, SamplingSoftmax
 from keras_uncertainty.models import DeepEnsembleClassifier, TwoHeadStochasticRegressor
 from keras_uncertainty.models import DisentangledStochasticClassifier, StochasticClassifier
 from keras_uncertainty.utils import numpy_entropy
@@ -44,7 +44,7 @@ def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
     x = Dense(inputs.shape[-1], activation='relu')(x)  # Changed to 'relu' since it is internal
     return x + res
 
-def build_model(input_shape, head_size, num_heads, ff_dim, num_transformer_blocks, mlp_units, dropout=0, mlp_dropout=0, num_classes=2):
+def build_model(input_shape, head_size, num_heads, ff_dim, num_transformer_blocks, mlp_units, dropout=0, mlp_dropout=0, num_classes=2, num_samples=100):
     inputs = Input(shape=input_shape)
     x = inputs
     for _ in range(num_transformer_blocks):
@@ -54,13 +54,21 @@ def build_model(input_shape, head_size, num_heads, ff_dim, num_transformer_block
     for dim in mlp_units:
         x = Dense(dim, activation='relu')(x)
         x = stochastic_layers.StochasticDropout(mlp_dropout)(x)
-    outputs = Dense(num_classes, activation='softmax')(x)  # Changed to 'softmax' for multi-class classification
-    return Model(inputs, outputs)
+    #outputs = Dense(num_classes, activation='softmax')(x)  # Changed to 'softmax' for multi-class classification
+    
+    logit_mean = Dense(num_classes, activation="linear")(x)
+    logit_var = Dense(num_classes, activation="softplus")(x)
+    probs = SamplingSoftmax(num_samples=num_samples, variance_type="linear_std")([logit_mean, logit_var])
+
+    train_model = Model(inputs, probs, name="train_model")
+    pred_model = Model(inputs, [logit_mean, logit_var], name="pred_model")
+
+    return train_model, pred_model#Model(inputs, outputs)
 
 input_shape = X_train.shape[1:]  # input shape (num_channels, sequence_length)
 
 def create_and_train_model(input_shape, num_classes=2):
-    model = build_model(
+    train_model, pred_model = build_model(
         input_shape,
         head_size=256,
         num_heads=4,
@@ -69,17 +77,13 @@ def create_and_train_model(input_shape, num_classes=2):
         mlp_units=[128],
         dropout=0.1,
         mlp_dropout=0.1,
-        num_classes=num_classes
+        num_classes=num_classes, 
+        num_samples=50
     )
-    model.summary()
-    model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
-    #history = model.fit(
-    #    X_train, y_train,
-    #    validation_data=(X_val, y_val),
-    #    epochs=10,
-    #    batch_size=32
-    #)
-    return model#, history
+    train_model.summary()
+    train_model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+
+    return train_model, pred_model
 
 def uncertainty(probs):
     return numpy_entropy(probs, axis=-1)
@@ -88,14 +92,15 @@ def uncertainty(probs):
 num_models = 2
 models = []
 histories = []
+temp_pred_model = []
 
 for _ in range(num_models):
-    model = create_and_train_model(input_shape, num_classes=2) #, history
-    models.append(model)
-    #histories.append(history)
+    train_model, pred_model = create_and_train_model(input_shape, num_classes=2) #, history
+    models.append(train_model)
+    temp_pred_model = pred_model
 
 ensemble = DeepEnsembleClassifier(models=models)
-ensemble.fit(X_train, y_train, verbose=2, epochs=12, batch_size=32)
+ensemble.fit(X_train, y_train, verbose=2, epochs=12, batch_size=64)
 preds = ensemble.predict(X_val)
 print("predictions:")
 print(preds)
@@ -145,64 +150,17 @@ plt.ylabel('Frequency')
 plt.grid(True)
 plt.show()
 
-# Separate uncertainty values for lateral (1) and palmar (0) grasps
-lateral_uncertainty = entropy_percent[y_val == 1]
-palmar_uncertainty = entropy_percent[y_val == 0]
-'''
-# Plot uncertainty for lateral and palmar grasps
-plt.figure(figsize=(10, 6))
-plt.plot(lateral_uncertainty, 'ro-', label='Lateral Grasp (1)')
-plt.plot(palmar_uncertainty, 'bo-', label='Palmar Grasp (0)')
-plt.title('Uncertainty for Lateral and Palmar Grasps')
-plt.xlabel('Sample Index')
-plt.ylabel('Uncertainty (%)')
-plt.legend()
-plt.grid(True)
-plt.show()
-'''
-
-def softmax(x, axis=-1):
-    x = x - np.max(x, axis=axis, keepdims=True)
-
-    return np.exp(x) / np.sum(np.exp(x), axis=axis, keepdims=True)
-
-def sampling_softmax(mean_logit, std_logit, num_samples=10):
-
-    # my only real change.
-    #logit_shape = (mean_logit.shape[0], num_samples)
-    logit_shape = (mean_logit.shape[0], num_samples, mean_logit.shape[-1])
-
-    logit_mean = np.expand_dims(mean_logit, axis=1)
-    logit_mean = np.repeat(logit_mean, num_samples, axis=1)
-
-    logit_std = np.expand_dims(std_logit, axis=1)
-    logit_std = np.repeat(logit_std, num_samples, axis=1)
-
-    logit_samples = np.random.normal(size=logit_shape, loc=logit_mean, scale=logit_std)
-
-    prob_samples = softmax(logit_samples, axis=-1)
-    probs = np.mean(prob_samples, axis=1)
-
-    # This is required due to approximation error, without it probabilities can sum to 1.01 or 0.99
-    probs = probs / np.sum(probs, axis=-1, keepdims=True)
-    
-    return probs
-
-def predict(self, inp, num_samples=None, batch_size=32):
-        y_logits_mean, y_logits_std_ale, y_logits_std_epi = TwoHeadStochasticRegressor.predict(self, inp, num_samples=num_samples, batch_size=batch_size, disentangle_uncertainty=True)
-
-        y_probs = sampling_softmax(y_logits_mean, y_logits_std_ale + y_logits_std_epi, num_samples=self.ale_num_samples)
-        y_probs_epi = sampling_softmax(y_logits_mean, y_logits_std_epi, num_samples=self.ale_num_samples)
-        y_probs_ale = sampling_softmax(y_logits_mean, y_logits_std_ale, num_samples=self.ale_num_samples)
-
-        return y_probs, y_probs_ale, y_probs_epi
 
 
-fin_model = DisentangledStochasticClassifier(models[0])
 
-domain = [X_val, y_val]
 
-pred_mean, pred_ale_std, pred_epi_std = predict(fin_model, X_val)
+
+
+NUM_SAMPLES = 50
+fin_model = DisentangledStochasticClassifier(temp_pred_model, epi_num_samples=NUM_SAMPLES)
+#domain = [X_val]
+pred_mean, pred_ale_std, pred_epi_std = fin_model.predict(X_val, batch_size=64)
+
 ale_entropy = uncertainty(pred_ale_std)
 epi_entropy = uncertainty(pred_epi_std)
 print("pred_mean")
@@ -243,7 +201,7 @@ def plot_training_history(histories):
     plt.show()
 
 # Plot the training history of all models in the ensemble.
-plot_training_history(histories)
+#plot_training_history(histories)
 
 def main():
 
