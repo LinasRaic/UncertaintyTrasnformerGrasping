@@ -1,9 +1,6 @@
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
-#from tensorflow.python.trackable import base as trackable
-#from tensorflow.keras.layers import Input, Dense, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D
-#from tensorflow.keras.models import Model
 from tensorflow import keras 
 from keras.layers import Input, Dense, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D 
 from keras.models import Model
@@ -12,15 +9,10 @@ from keras_uncertainty.layers import stochastic_layers, SamplingSoftmax
 from keras_uncertainty.models import DeepEnsembleClassifier, TwoHeadStochasticRegressor
 from keras_uncertainty.models import DisentangledStochasticClassifier, StochasticClassifier
 from keras_uncertainty.utils import numpy_entropy
-#from keras_uncertainty.losses import regression_gaussian_nll_loss
 from sklearn.model_selection import train_test_split
 from tensorflow.python.client import device_lib
-
-print(device_lib.list_local_devices())
-print("TensorFlow version:", tf.__version__)
-print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
-print(tf.config.list_physical_devices('GPU'))
-# Load segments and labels FOR SINGLE participant
+from keras.callbacks import EarlyStopping
+from sklearn.model_selection import StratifiedShuffleSplit
 
 
 # Load segments and labels for the first participant
@@ -41,7 +33,7 @@ def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
     x = LayerNormalization(epsilon=1e-6)(res)
     x = Dense(ff_dim, activation='relu')(x)
     x = stochastic_layers.StochasticDropout(dropout)(x)
-    x = Dense(inputs.shape[-1], activation='relu')(x)  # Changed to 'relu' since it is internal
+    x = Dense(inputs.shape[-1], activation='relu')(x)  
     return x + res
 
 def build_model(input_shape, head_size, num_heads, ff_dim, num_transformer_blocks, mlp_units, dropout=0, mlp_dropout=0, num_classes=2, num_samples=100):
@@ -54,25 +46,30 @@ def build_model(input_shape, head_size, num_heads, ff_dim, num_transformer_block
     for dim in mlp_units:
         x = Dense(dim, activation='relu')(x)
         x = stochastic_layers.StochasticDropout(mlp_dropout)(x)
-    #outputs = Dense(num_classes, activation='softmax')(x)  # Changed to 'softmax' for multi-class classification
     
     logit_mean = Dense(num_classes, activation="linear")(x)
-    logit_var = Dense(num_classes, activation="softplus")(x)
+    logit_var = Dense(num_classes, activation="softmax")(x) #softplus
     probs = SamplingSoftmax(num_samples=num_samples, variance_type="linear_std")([logit_mean, logit_var])
 
     train_model = Model(inputs, probs, name="train_model")
     pred_model = Model(inputs, [logit_mean, logit_var], name="pred_model")
 
-    return train_model, pred_model#Model(inputs, outputs)
+    return train_model, pred_model
 
 input_shape = X_train.shape[1:]  # input shape (num_channels, sequence_length)
+
+early_stopping = EarlyStopping(
+    monitor='loss',
+    patience=30,
+    restore_best_weights=True 
+)
 
 def create_and_train_model(input_shape, num_classes=2):
     train_model, pred_model = build_model(
         input_shape,
         head_size=256,
         num_heads=4,
-        ff_dim=4,
+        ff_dim=64,
         num_transformer_blocks=4,
         mlp_units=[128],
         dropout=0.1,
@@ -81,7 +78,7 @@ def create_and_train_model(input_shape, num_classes=2):
         num_samples=50
     )
     train_model.summary()
-    train_model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    train_model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy']) 
 
     return train_model, pred_model
 
@@ -100,7 +97,7 @@ for _ in range(num_models):
     temp_pred_model = pred_model
 
 ensemble = DeepEnsembleClassifier(models=models)
-ensemble.fit(X_train, y_train, verbose=2, epochs=12, batch_size=64)
+ensemble.fit(X_train, y_train, verbose=2, epochs=100, batch_size=64, callbacks=[early_stopping])
 preds = ensemble.predict(X_val)
 print("predictions:")
 print(preds)
@@ -150,12 +147,7 @@ plt.ylabel('Frequency')
 plt.grid(True)
 plt.show()
 
-
-
-
-
-
-
+'''
 NUM_SAMPLES = 50
 fin_model = DisentangledStochasticClassifier(temp_pred_model, epi_num_samples=NUM_SAMPLES)
 #domain = [X_val]
@@ -169,7 +161,13 @@ print("ale_entropy")
 print(ale_entropy)
 print("epi_entropy")
 print(epi_entropy)
+print(pred_ale_std.shape)
+print(ale_entropy.shape)
+print(pred_epi_std.shape)
+print(epi_entropy.shape)
+'''
 
+#curently unused
 def plot_training_history(histories):
     plt.figure(figsize=(14, 6))
     
@@ -199,6 +197,64 @@ def plot_training_history(histories):
 
     plt.tight_layout()
     plt.show()
+
+
+# Define the downsampling proportions
+proportions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.8, 1]
+
+# Storage for results
+aleatoric_uncertainties = []
+epistemic_uncertainties = []
+
+# Split data initially to keep a constant validation set
+X_train_full, X_val, y_train_full, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+for proportion in proportions:
+    print(f"\n--- Training with {int(proportion * 100)}% of the training data ---\n")
+    
+    # Downsample the training data
+    num_samples = int(proportion * len(X_train_full))
+    np.random.seed(42)  # For reproducibility
+    indices = np.random.choice(len(X_train_full), num_samples, replace=False)
+    X_train = X_train_full[indices]
+    y_train = y_train_full[indices]
+
+    # Create and train the model
+    train_model, pred_model = create_and_train_model(input_shape, num_classes=2)
+    train_model.fit(X_train, y_train, epochs=100, batch_size=16, verbose=2, callbacks=[early_stopping])
+    
+    # Uncertainty calculation
+    NUM_SAMPLES = 50
+    fin_model = DisentangledStochasticClassifier(pred_model, epi_num_samples=NUM_SAMPLES)
+    _, pred_ale_std, pred_epi_std = fin_model.predict(X_val, batch_size=16)
+    
+    # Compute mean aleatoric and epistemic uncertainties
+    ale_entropy = uncertainty(pred_ale_std)
+    epi_entropy = uncertainty(pred_epi_std)
+
+    # filter out values lower than 0.01
+    filtered_ale_entropy = ale_entropy[ale_entropy > 0.01]
+    filtered_epi_entropy = epi_entropy[epi_entropy > 0.01]
+
+    mean_aleatoric = np.mean(filtered_ale_entropy) if len(filtered_ale_entropy) > 0 else 0
+    mean_epistemic = np.mean(filtered_epi_entropy) if len(filtered_epi_entropy) > 0 else 0
+    
+    print(f"Mean Aleatoric Uncertainty: {mean_aleatoric}")
+    print(f"Mean Epistemic Uncertainty: {mean_epistemic}")
+    
+    aleatoric_uncertainties.append(mean_aleatoric)
+    epistemic_uncertainties.append(mean_epistemic)
+
+# Plotting the results of uncertainty disentanglement
+plt.figure(figsize=(10, 6))
+plt.plot([int(proportion * 100) for proportion in proportions], aleatoric_uncertainties, label='Aleatoric Uncertainty', marker='o')
+plt.plot([int(proportion * 100) for proportion in proportions], epistemic_uncertainties, label='Epistemic Uncertainty', marker='o')
+plt.title('Uncertainty Comparison Across Training Set Sizes')
+plt.xlabel('Training Set Size (%)')
+plt.ylabel('Mean Uncertainty')
+plt.grid(True)
+plt.legend()
+plt.show()
 
 # Plot the training history of all models in the ensemble.
 #plot_training_history(histories)
